@@ -1,0 +1,24 @@
+## Interface: 16001
+## Title: Warehouse
+## Notes: A searchable database of your characters' bags, personal banks, guild banks and mailboxes.
+## Author: MendeleevForever
+## Version: 0.1.4
+## Category: Bags/Inventory
+## SavedVariables: WarehouseDB
+## SavedVariablesPerCharacter: WarehouseCharDB
+## IconTexture: 413587
+## AddonCompartmentFunc: Warehouse_OnAddonCompartmentClick
+## AddonCompartmentFuncOnEnter: Warehouse_OnAddonCompartmentEnter
+## AddonCompartmentFuncOnLeave: Warehouse_OnAddonCompartmentLeave
+
+Libs\LibStub\LibStub.lua
+Libs\CallbackHandler-1.0\CallbackHandler-1.0.xml
+Libs\LibDataBroker-1.1\LibDataBroker-1.1.lua
+Libs\LibDBIcon-1.0\lib.xml
+
+Core.lua
+Scan.lua
+Index.lua
+Widgets.lua
+UI.lua
+Panels.lua
