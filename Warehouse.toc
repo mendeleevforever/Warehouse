@@ -2,7 +2,7 @@
 ## Title: Warehouse
 ## Notes: A searchable database of your characters' bags, personal banks, guild banks and mailboxes.
 ## Author: MendeleevForever
-## Version: 0.1.4
+## Version: 0.2.1
 ## Category: Bags/Inventory
 ## SavedVariables: WarehouseDB
 ## SavedVariablesPerCharacter: WarehouseCharDB

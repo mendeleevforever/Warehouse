@@ -11,9 +11,10 @@ local addonName, ns = ...
 --     the tooltip text; tooltips are read in the background for the session.
 --   * Item tooltips: who holds the item, by location (TooltipDataProcessor).
 --
--- Filters work on owners (characters and guild banks): region area, the
--- realm's ruleset group (PvE / PvP), faction and "who"; locations then pick
--- which of each owner's places count.
+-- Filters work on owners (characters and guild banks): region, ruleset (as
+-- the game reported it), faction and "who"; locations and the guild bank
+-- filter then pick which of each owner's places count. Nothing is keyed by
+-- realm.
 
 local WH, Scan = ns.WH, ns.Scan
 local Index = {}
@@ -26,7 +27,7 @@ Index.metaById = {}       -- [itemID] = { meta, ... }
 Index.tips     = {}       -- [item key] = lower-case tooltip text (session)
 
 local COUNT_LOCS = { "bags", "bank", "equipped" }
-local RULE_KEYS  = { "PVE", "PVP", "UNSET" }
+local RULE_KEYS  = ns.RULE_FILTER
 
 -------------------------------------------------------------------------------
 -- Owner filters
@@ -34,7 +35,7 @@ local RULE_KEYS  = { "PVE", "PVP", "UNSET" }
 function Index:OwnerPasses(kind, key, rec)
     local s = WH.db.settings
     if not s.regions[ns.AreaGroup(rec.area)] then return false end
-    if not s.rulesets[ns.RuleGroup(rec.ruleset)] then return false end
+    if not s.rulesets[ns.RuleKey(rec.ruleset)] then return false end
     if rec.faction and not s.factions[rec.faction] then return false end
     local who = s.who
     if who == "all" then return true end
@@ -43,7 +44,7 @@ function Index:OwnerPasses(kind, key, rec)
     if who == "me" then
         if kind == "char" then return key == Scan.meKey end
         return key == me.guild
-    elseif who == "realm" then
+    elseif who == "ruleset" then
         return Scan:SameWorld(rec)
     elseif who == "pick" then
         if kind == "char" then return key == s.pick end
@@ -59,10 +60,28 @@ local function Flags(list, set)
     return table.concat(out)
 end
 
+-- The guild banks and tabs left out, in a stable order
+local function Excluded(set)
+    local out = {}
+    for k, v in pairs(set) do if v then out[#out + 1] = k end end
+    table.sort(out)
+    return table.concat(out, ",")
+end
+
 local function Signature(s)
     return table.concat({ Scan.version, s.who, s.pick, Scan.meKey or "-",
         Flags(ns.AREA_ORDER, s.regions), Flags(RULE_KEYS, s.rulesets),
-        Flags(ns.FACTION_ORDER, s.factions), Flags(ns.LOCATIONS, s.locations) }, "|")
+        Flags(ns.FACTION_ORDER, s.factions), Flags(ns.LOCATIONS, s.locations),
+        Excluded(s.guildOff), Excluded(s.tabOff) }, "|")
+end
+
+-- The guild bank filter: is this guild bank, or this tab of it, shown?
+function Index:GuildShown(guildKey)
+    return not WH.db.settings.guildOff[guildKey]
+end
+
+function Index:TabShown(guildKey, tab)
+    return not WH.db.settings.guildOff[guildKey] and not WH.db.settings.tabOff[ns.GuildTabKey(guildKey, tab)]
 end
 
 function Index:Invalidate()
@@ -131,12 +150,14 @@ function Index:Build()
 
     if s.locations.guild then
         for key, g in pairs(WH.db.guilds) do
-            if self:OwnerPasses("guild", key, g) then
+            if self:GuildShown(key) and self:OwnerPasses("guild", key, g) then
                 local o = Owner("guild", key, g)
                 totals.guilds = totals.guilds + 1
                 totals.guildGold = totals.guildGold + (g.money or 0)
-                for _, t in pairs(g.tabs) do
-                    for k, n in pairs(t.items) do Add(o, "guild", k, n, t.t) end
+                for tab, t in pairs(g.tabs) do
+                    if self:TabShown(key, tab) then
+                        for k, n in pairs(t.items) do Add(o, "guild", k, n, t.t) end
+                    end
                 end
             end
         end
@@ -176,9 +197,9 @@ function Index:Holders(key)
     end
     if s.locations.guild then
         for ownerKey, g in pairs(WH.db.guilds) do
-            if self:OwnerPasses("guild", ownerKey, g) then
+            if self:GuildShown(ownerKey) and self:OwnerPasses("guild", ownerKey, g) then
                 for tab, t in pairs(g.tabs) do
-                    local n = t.items[key]
+                    local n = self:TabShown(ownerKey, tab) and t.items[key]
                     if n then rows[#rows + 1] = { owner = ownerKey, kind = "guild", rec = g, loc = "guild", n = n, t = t.t, tab = tab, tabName = t.name } end
                 end
             end
@@ -460,7 +481,7 @@ end
 local function InScope(rec, scope)
     local me = Scan.me
     if scope == "all" or not me then return true end
-    if scope == "realm" then return Scan:SameWorld(rec) end
+    if scope == "ruleset" then return Scan:SameWorld(rec) end
     return rec.region == me.region
 end
 

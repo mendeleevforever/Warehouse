@@ -12,25 +12,19 @@ local addonName, ns = ...
 --     at once ("in the mail"), and replaced by the real mailbox when that
 --     character next opens it
 --
--- Records:
---   realms[realm key]         = { name, server, region, ruleset, guessed, unknown }
---   chars[region/full name]   = { name, realm, realmKey, region, area, ruleset, faction,
---                                 class, level, money, lastSeen, guild,
+-- Records (never keyed by realm: Forever has none):
+--   chars[UnitGUID("player")] = { name, region, area, ruleset, faction, class, level,
+--                                 money, lastSeen, guild,
 --                                 bags = { items = {[key] = count}, used, slots, t },
 --                                 bank = { same }, equipped = { items, t },
 --                                 mail = { list = { {k, c, x, f, cod, ret, sent} }, money, count, more, t } }
---   guilds[realm key/guild]   = { name, realm, realmKey, region, area, ruleset, faction, money, numTabs, t,
---                                  tabs = { [tab] = { name, icon, items, used, t } } }
--- Identity on Forever: characters have a first name and a surname, unique
--- per region, so a character is keyed by region and full name. Since the
--- 1.60.1.71037 hotfix the client hides realm names (GetRealmName() returns
--- ""), so a realm is known by the server number in the player's GUID
--- ("Player-<server>-<id>") when there's no name. The ruleset is read from
--- the game's own rules (C_GameRules) at each login and kept on the
--- character; characters on the same server share it until they log in
--- themselves. Where the game can't say, the player sets it once.
--- WarehouseCharDB (per character) remembers the key in case a later build
--- hides the name too.
+--   guilds["club:<id>" or "name:<faction>:<guild>"] = { name, region, area, ruleset, faction,
+--                                 money, numTabs, t, tabs = { [tab] = { name, icon, items, used, t } } }
+-- Identity: a character is keyed by UnitGUID("player"), used whole and never
+-- parsed. Whether it stays the same between sessions on Forever isn't
+-- verified yet, so WarehouseCharDB (per character) remembers the key and a
+-- changed ID moves the record. Region and ruleset come only from
+-- ns.GetRegion and ns.GetRuleset (Core.lua); faction from UnitFactionGroup.
 -- Item keys: "12345" for a plain item, "12345:suffix:bonus.bonus" for items
 -- with a random suffix or bonus IDs (their item string is kept in db.links).
 --
@@ -56,7 +50,12 @@ Scan.facts   = {}             -- [item key] = { ilvl, sell, stack } once the ite
 -------------------------------------------------------------------------------
 local COUNT_LOCS = { "bags", "bank", "equipped" }
 
-function Scan.RepairChar(c, db)
+-- Rulesets saved by 0.1.x. Only the ones the game reported carry over (an
+-- RP-PvP character reads as RP with ns.GetRuleset); the rest are read again
+-- at that character's next login.
+local OLD_RULESETS = { normal = "PvE", pvp = "PvP", rp = "RP", rppvp = "RP", hardcore = "Hardcore" }
+
+function Scan.RepairChar(c)
     for _, loc in ipairs(COUNT_LOCS) do
         local L = c[loc]
         if type(L) ~= "table" then L = {}; c[loc] = L end
@@ -76,24 +75,19 @@ function Scan.RepairChar(c, db)
     end
     m.t, m.money, m.more, m.count = Num(m.t) or 0, Num(m.money) or 0, Num(m.more) or 0, Num(m.count) or 0
     if type(c.region) ~= "string" then c.region = "??" end
-    c.area, c.areaGuessed = ns.AreaFor(c.region), nil      -- always the client's region (an old "OCE" becomes US)
+    c.area, c.areaGuessed = ns.AreaFor(c.region), nil
     if not ns.FACTIONS[c.faction or ""] then c.faction = nil end
     c.money, c.level, c.lastSeen = Num(c.money), Num(c.level), Num(c.lastSeen) or 0
     if type(c.class) ~= "string" then c.class = nil end
     if type(c.guild) ~= "string" then c.guild = nil end
-    if type(c.realm) ~= "string" then c.realm = "" end
-    if type(c.realmKey) ~= "string" then c.realmKey = c.region .. "/" .. (c.realm ~= "" and c.realm or "?") end
     if not ns.RULESETS[c.ruleset or ""] then
-        local r = db and db.realms[c.realmKey]        -- 0.1.0 kept the ruleset on the realm only
-        if r and ns.RULESETS[r.ruleset or ""] then
-            c.ruleset, c.rulesetGuessed = r.ruleset, r.guessed or nil
-        else
-            c.ruleset = ""
-        end
+        c.ruleset = c.rulesetDetected and OLD_RULESETS[c.ruleset or ""] or ""
     end
+    c.rulesetDetected, c.rulesetGuessed = nil, nil
+    c.realm, c.realmKey = nil, nil                -- 0.1.x kept realms; Forever has none
 end
 
-function Scan.RepairGuild(g, db)
+function Scan.RepairGuild(g)
     if type(g.tabs) ~= "table" then g.tabs = {} end
     for i, t in pairs(g.tabs) do
         if type(i) ~= "number" or type(t) ~= "table" then
@@ -105,41 +99,19 @@ function Scan.RepairGuild(g, db)
         end
     end
     g.money, g.t, g.numTabs = Num(g.money), Num(g.t) or 0, Num(g.numTabs)
-    if type(g.realm) ~= "string" then g.realm = "" end
     if type(g.region) ~= "string" then g.region = "??" end
-    if type(g.realmKey) ~= "string" then g.realmKey = g.region .. "/" .. (g.realm ~= "" and g.realm or "?") end
-    if not ns.RULESETS[g.ruleset or ""] then
-        local r = db and db.realms[g.realmKey]
-        g.ruleset = (r and ns.RULESETS[r.ruleset or ""]) and r.ruleset or ""
-    end
     g.area = ns.AreaFor(g.region)
     if not ns.FACTIONS[g.faction or ""] then g.faction = nil end
+    if not ns.RULESETS[g.ruleset or ""] then g.ruleset = "" end   -- taken from your character at the next visit
+    g.realm, g.realmKey = nil, nil
 end
 
 -------------------------------------------------------------------------------
--- Region, Oceanic guess, ruleset guess
+-- Region (read with ns.GetRegion, Core.lua)
 -------------------------------------------------------------------------------
-local REGION_BY_ID = { [1] = "US", [2] = "KR", [3] = "EU", [4] = "TW", [5] = "CN" }
-
 function Scan:ClientRegion()
-    local name = GetCurrentRegionName and Text((ns.SafeCall(GetCurrentRegionName)))   -- RETEST
-    if name then return name:upper() end
-    local id = GetCurrentRegion and Num((ns.SafeCall(GetCurrentRegion)))              -- RETEST
-    return (id and REGION_BY_ID[id]) or "??"
+    return (ns.GetRegion()) or "??"
 end
-
--- Forever has one realm per ruleset per region; if the realm's name says
--- which ruleset it is, use that. Otherwise the player sets it once.
-local function GuessRuleset(realmName)
-    local r = realmName:lower()
-    local rp = r:find("roleplay", 1, true) or r:find("%f[%a]rp%f[%A]")
-    if r:find("pvp", 1, true) then return rp and "rppvp" or "pvp" end
-    if r:find("hardcore", 1, true) then return "hardcore" end
-    if rp then return "rp" end
-    if r:find("normal", 1, true) or r:find("pve", 1, true) then return "normal" end
-    return nil
-end
-Scan.GuessRuleset = GuessRuleset
 
 -------------------------------------------------------------------------------
 -- Class colours and owner names
@@ -163,25 +135,14 @@ ns.GUILD_HEX = "|cff40c040"
 
 function ns.RulesetLabel(rec)
     local rs = ns.RULESETS[rec.ruleset or ""]
-    return rs and rs.label or "ruleset not set"
+    return rs and rs.label or "ruleset not read yet"
 end
 
--- The realm's name, when the client ever gave one (Forever hides it now)
-function ns.RealmName(rec)
-    if rec.realm and rec.realm ~= "" then return rec.realm end
-    local r = WH.db and rec.realmKey and WH.db.realms[rec.realmKey]
-    if r and r.name and r.name ~= "" then return r.name end
-    return nil
-end
-
--- "Normal  •  Oceanic", or with a realm name "Realm 10  •  Roleplay  •  EU"
+-- "PvE", or with the region "PvE  •  US"
 function ns.PlaceText(rec, withArea)
-    local parts = {}
-    local realm = ns.RealmName(rec)
-    if realm then parts[#parts + 1] = realm end
-    parts[#parts + 1] = ns.RulesetLabel(rec)
-    if withArea then parts[#parts + 1] = ns.AREAS[rec.area] or rec.region or "?" end
-    return table.concat(parts, "  •  ")
+    local text = ns.RulesetLabel(rec)
+    if withArea then text = text .. "  •  " .. (ns.AREAS[rec.area] or rec.region or "?") end
+    return text
 end
 
 -- Coloured owner name: a character in its class colour, a guild bank as <Guild>
@@ -191,29 +152,97 @@ function ns.OwnerLabel(kind, rec)
 end
 
 -------------------------------------------------------------------------------
--- The character being played
+-- Guild banks: keyed by the guild's club ID when the game gives one
+-- (C_Club.GetGuildClubId), otherwise by faction and guild name. Never by realm.
 -------------------------------------------------------------------------------
 function Scan:CurrentGuildKey()
     local me = self.me
     if not me or not GetGuildInfo then return nil end
     local gname = Text((ns.SafeCall(GetGuildInfo, "player")))      -- RETEST; guarded: guild names are unit data
     if not gname then return nil end
-    return me.realmKey .. "/" .. gname, gname
+    local club
+    if C_Club and C_Club.GetGuildClubId then                       -- RETEST: a number on live, November 24, 2026
+        local id = ns.SafeCall(C_Club.GetGuildClubId)
+        id = Num(id) or Text(id)
+        if id then club = "club:" .. tostring(id) end
+    end
+    return club or ("name:%s:%s"):format(me.faction or "?", gname), gname, club ~= nil
+end
+
+-- A guild bank's region, ruleset and faction come from your character
+function Scan:TouchGuild(g)
+    local me = self.me
+    g.region, g.area = me.region, me.area
+    g.faction = me.faction or g.faction
+    if me.ruleset ~= "" then g.ruleset = me.ruleset end
+end
+
+-- A guild bank moved to a new key: its filter entries and references follow
+function Scan:MoveGuild(oldKey, newKey)
+    local db = WH.db
+    db.guilds[newKey], db.guilds[oldKey] = db.guilds[oldKey], nil
+    local s = db.settings
+    if s.guildOff[oldKey] then s.guildOff[newKey], s.guildOff[oldKey] = true, nil end
+    -- collect first: a table can't gain keys while it's being looped over
+    local prefix, moved = ns.GuildTabKey(oldKey, ""), {}
+    for k in pairs(s.tabOff) do
+        if k:sub(1, #prefix) == prefix then moved[#moved + 1] = k end
+    end
+    for _, k in ipairs(moved) do
+        s.tabOff[k] = nil
+        s.tabOff[ns.GuildTabKey(newKey, k:sub(#prefix + 1))] = true
+    end
+    for _, c in pairs(db.chars) do
+        if c.guild == oldKey then c.guild = newKey end
+    end
+end
+
+-- The current guild's bank record. One saved under another key for the same
+-- guild (0.1.x realm keys, or the other key form) moves to this key first;
+-- two different club IDs are never merged.
+function Scan:GuildRecord(create)
+    local key, gname, isClub = self:CurrentGuildKey()
+    if not key then return nil end
+    local db, me = WH.db, self.me
+    local g = db.guilds[key]
+    if not g then
+        local found
+        for k, old in pairs(db.guilds) do
+            local sameGuild = old.name == gname and (old.faction == nil or old.faction == me.faction)
+            if k ~= key and sameGuild and not (isClub and k:sub(1, 5) == "club:") then found = k break end
+        end
+        if found then
+            g = db.guilds[found]
+            self:MoveGuild(found, key)
+        end
+    end
+    if not g and create then
+        g = { name = gname, tabs = {}, t = 0 }
+        db.guilds[key] = g
+    end
+    if g then
+        g.name = gname
+        Scan.RepairGuild(g)
+        self:TouchGuild(g)
+        me.guild = key
+    end
+    return g, key
 end
 
 function Scan:RefreshGuild(clearIfNone)
     local c = self.me
     if not c then return end
-    local key = self:CurrentGuildKey()
+    local _, key = self:GuildRecord(false)
     if key then
         c.guild = key
-        local g = WH.db.guilds[key]
-        if g then self:TouchGuild(g) end
     elseif clearIfNone and IsInGuild then
         if Bool(IsInGuild()) == false then c.guild = nil end   -- only a real "no", never a secret or a not-loaded answer
     end
 end
 
+-------------------------------------------------------------------------------
+-- The character being played
+-------------------------------------------------------------------------------
 -- Gold. GetMoney() reads 0 while the game logs out (Warehouse 0.1.0 and
 -- 0.1.1 saved that 0) and can for a moment at login, so a 0 only replaces
 -- saved gold once the game has confirmed it: a PLAYER_MONEY event, or after
@@ -243,9 +272,9 @@ function Scan:RefreshMe()
     self:RefreshGuild(false)
 end
 
--- The player's full name. Forever characters have a first name and a
--- surname: UnitName("player") returns them as its two values, and Blizzard's
--- own Forever UI joins them with a space. Names are unique per region.
+-- The player's full name, for showing only (characters are keyed by their
+-- GUID: a bare name may not be unique). Forever characters have a first name
+-- and a surname, which UnitName("player") returns as its two values.
 function Scan.PlayerName()
     local first, second = UnitName("player")
     first, second = Text(first), Text(second)                   -- guarded: names can be secret values
@@ -254,157 +283,82 @@ function Scan.PlayerName()
     return GetUnitName and Text((ns.SafeCall(GetUnitName, "player", true))) or nil
 end
 
--- The realm's name (nil when hidden) and the server number from the player's GUID
-function Scan.PlayerRealm()
-    local name = GetRealmName and Text((ns.SafeCall(GetRealmName)))           -- RETEST: "" since 1.60.1.71037
-    local guid = UnitGUID and Text((ns.SafeCall(UnitGUID, "player")))         -- RETEST
-    local server = guid and guid:match("^Player%-(%d+)%-") or nil
-    return name, server
+function Scan.PlayerGUID()
+    return UnitGUID and Text(UnitGUID("player")) or nil       -- RETEST; guarded, used whole, never parsed
 end
 
--- The ruleset from the game's own rules: Hardcore; RP and PvP together are
--- Roleplay PvP; RP; PvP; none of them is Normal. Returns the ruleset (nil
--- when the client can't say: no API, an error or a secret answer) and a
--- description of what each rule answered, for the probe.
-local RULES = { { "hc", "HardcoreRuleset", "Hardcore" }, { "rp", "RPRuleset", "RP" }, { "pvp", "PvPRuleset", "PvP" } }
-
-function Scan.DetectRuleset()
-    local api = C_GameRules and C_GameRules.IsGameRuleActive               -- RETEST
-    local enum = Enum and Enum.GameRule                                    -- RETEST: PvPRuleset 213, RPRuleset 214, HardcoreRuleset 10 on 71037
-    if type(api) ~= "function" or type(enum) ~= "table" then return nil, "C_GameRules.IsGameRuleActive not found" end
-    local on, words = {}, {}
-    for _, r in ipairs(RULES) do
-        local id = enum[r[2]]
-        local value, word
-        if type(id) ~= "number" then
-            value, word = false, "missing"                -- this client has no such rule, so it isn't on
-        else
-            local ok, v = pcall(api, id)
-            if not ok then
-                word = "error"
-            elseif ns.IsSecret(v) then
-                word = "secret"
-            else
-                value = Bool(v)
-                word = value == nil and "unclear" or (value and "on" or "off")
-            end
-        end
-        on[r[1]] = value
-        words[#words + 1] = r[3] .. " " .. word
-    end
-    local detail = table.concat(words, ", ")
-    if on.hc then return "hardcore", detail end
-    if on.hc == nil or on.rp == nil or on.pvp == nil then return nil, detail end
-    if on.rp and on.pvp then return "rppvp", detail end
-    if on.rp then return "rp", detail end
-    if on.pvp then return "pvp", detail end
-    return "normal", detail
-end
-
--- The game said which ruleset this character is on: it wins over a choice
--- or a guess, and characters on the same server that haven't told Warehouse
--- themselves get it too. Returns true when anything changed.
-function Scan:ApplyDetectedRuleset(key, ruleset)
-    local db = WH.db
-    local c = db.chars[key]
-    if not c then return false end
-    local changed = c.ruleset ~= ruleset or not c.rulesetDetected
-    c.ruleset, c.rulesetDetected, c.rulesetGuessed = ruleset, true, nil
-    local r = db.realms[c.realmKey]
-    if r and not r.unknown then
-        r.ruleset, r.guessed, r.detected = ruleset, false, true
-        for _, o in pairs(db.chars) do
-            if o.realmKey == c.realmKey and not o.rulesetDetected and o.ruleset ~= ruleset then
-                o.ruleset, o.rulesetGuessed = ruleset, nil
-                changed = true
-            end
-        end
-        for _, g in pairs(db.guilds) do
-            if g.realmKey == c.realmKey then g.ruleset = ruleset end
-        end
-    end
-    local g = c.guild and db.guilds[c.guild]
-    if g then g.ruleset = ruleset end
-    return changed
-end
-
--- Reads the ruleset for the character being played; tells the player when
--- the game disagrees with what they had set
+-- The ruleset from the game (ns.GetRuleset). Only the game's answer is
+-- saved; when this build can't say, the character shows "ruleset not read yet".
 function Scan:ReadRuleset()
-    local c, key = self.me, self.meKey
+    local c = self.me
     if not c then return false end
-    local ruleset = Scan.DetectRuleset()
+    local ruleset = ns.GetRuleset()
     if not ruleset then return false end
-    local before, wasDetected = c.ruleset, c.rulesetDetected
-    local changed = self:ApplyDetectedRuleset(key, ruleset)
-    if before ~= "" and before ~= ruleset and not wasDetected then
-        ns.Print(("the game says %s is on %s, not %s; Warehouse uses that from now on."):format(
-            c.name, ns.RULESETS[ruleset].label, ns.RulesetLabel({ ruleset = before })))
-    end
     self.rulesetRead = true
+    local changed = c.ruleset ~= ruleset
+    c.ruleset = ruleset
+    local g = c.guild and WH.db.guilds[c.guild]
+    if g and g.ruleset ~= ruleset then g.ruleset, changed = ruleset, true end
     return changed
 end
 
-local askedRuleset = {}
+local toldRuleset = false
 
-function Scan:AskRuleset()
-    local c, key = self.me, self.meKey
-    if not c or c.ruleset ~= "" or askedRuleset[key] then return end
-    askedRuleset[key] = true
-    ns.Print(("which ruleset is %s on? The game didn't say this time. Type |cffffd100/warehouse ruleset normal|r, pvp, rp, rppvp or hardcore, or right-click them on the Characters tab."):format(c.name))
+function Scan:TellRulesetMissing()
+    if toldRuleset or self.rulesetRead or not self.me then return end
+    toldRuleset = true
+    local _, why = ns.GetRuleset()
+    ns.Print(("the game didn't tell addons %s's ruleset (%s), so it shows as \"ruleset not read yet\" and the Ruleset filter lists it under Not read yet."):format(self.me.name, why))
+end
+
+-- Characters are saved under UnitGUID("player"). Whether that ID stays the
+-- same between sessions on Forever isn't verified yet, so the per-character
+-- WarehouseCharDB also remembers the key: if the ID ever changes, the
+-- character's record moves to the new one instead of starting over.
+local function IsLegacyKey(key)
+    return key:find("/", 1, true) ~= nil                       -- 0.1.x keys: "US/First Last"
 end
 
 function Scan:Identify()
     local db = WH.db
-    local region = self:ClientRegion()
+    local guid = Scan.PlayerGUID()
     local remembered = WH.charDB and WH.charDB.key
     local name = Scan.PlayerName()
-    if not name then
-        -- the client hides the name for now: use the record this character had last time
-        local old = remembered and db.chars[remembered]
-        if not old then return false end
-        name = old.name
+    local key = guid
+    if not key then
+        -- the client hides the ID for now: use the record this character had last time
+        if remembered and db.chars[remembered] then key = remembered else return false end
     end
-    local key = region .. "/" .. name
+    local region = Scan:ClientRegion()
 
-    -- carry over a record saved under another key (Warehouse 0.1.0, or a renamed character)
     if not db.chars[key] then
-        local old = (remembered and remembered ~= key and db.chars[remembered]) and remembered or nil
-        if not old then
+        local old, idChanged
+        if remembered and remembered ~= key and db.chars[remembered] then
+            old, idChanged = remembered, not IsLegacyKey(remembered)
+        elseif name then
             for k, c in pairs(db.chars) do
-                if k ~= key and c.region == region and c.name == name then old = k break end
+                if IsLegacyKey(k) and c.name == name and c.region == region then old = k break end
             end
         end
         if old then
             db.chars[key], db.chars[old] = db.chars[old], nil
             if db.settings.pick == old then db.settings.pick = key end
+            if idChanged then
+                ns.Print(("%s's game ID (UnitGUID) changed since last time; Warehouse moved its saved items to the new one."):format(db.chars[key].name))
+            end
         end
     end
 
-    local realmName, server = Scan.PlayerRealm()
-    local realmKey = region .. "/" .. (server and ("#" .. server) or realmName or "?")
-    local realm = db.realms[realmKey]
-    if not realm then
-        realm = { name = realmName or "", server = server, region = region, ruleset = "", guessed = false, unknown = (not server and not realmName) or nil }
-        db.realms[realmKey] = realm
-    end
-    if realmName and realm.name ~= realmName then realm.name = realmName end
-    if realm.ruleset == "" and realmName then
-        local guess = GuessRuleset(realmName)
-        if guess then realm.ruleset, realm.guessed = guess, true end
-    end
-
     local c = db.chars[key]
-    local isNew = c == nil
-    if isNew then
-        c = { name = name, region = region }
+    if not c then
+        if not name then return false end                     -- a new character needs its name
+        c = { name = name }
         db.chars[key] = c
     end
-    c.name, c.region, c.realmKey = name, region, realmKey
-    if realmName then c.realm = realmName end
-    Scan.RepairChar(c, db)
-    if c.ruleset == "" and realm.ruleset ~= "" then c.ruleset, c.rulesetGuessed = realm.ruleset, realm.guessed end
-    self.me, self.meKey, self.realmKey = c, key, realmKey
+    if name then c.name = name end
+    if region ~= "??" or type(c.region) ~= "string" then c.region = region end
+    Scan.RepairChar(c)
+    self.me, self.meKey = c, key
     if WH.charDB then WH.charDB.key = key end
     self:RefreshMe()
     self:ReadRuleset()
@@ -421,7 +375,7 @@ function Scan:AfterIdentify()
     C_Timer.After(8, function() Scan:WarnExpiring(false) end)
     C_Timer.After(3, function()
         if not Scan.rulesetRead and Scan:ReadRuleset() then Scan:Changed() end
-        if not Scan.rulesetRead then Scan:AskRuleset() end
+        if not Scan.rulesetRead then Scan:TellRulesetMissing() end
     end)
     self:Changed()
 end
@@ -432,7 +386,7 @@ function Scan:OnLogin()
         self:AfterIdentify()
         return
     end
-    -- the name can be missing (or secret) for a moment at login; try again shortly
+    -- the name and ID can be missing (or secret) for a moment at login; try again shortly
     local tries, ticker = 0, nil
     ticker = C_Timer.NewTicker(2, function()
         tries = tries + 1
@@ -441,7 +395,7 @@ function Scan:OnLogin()
             Scan:AfterIdentify()
         elseif tries >= 15 then
             ticker:Cancel()
-            ns.Print("the game is hiding this character's name from addons, so nothing is saved this session. Type /reload to try again; if it keeps happening, type /warehouse probe and include the Name line when you report it.")
+            ns.Print("the game is hiding this character's name or ID from addons, so nothing is saved this session. Type /reload to try again; if it keeps happening, type /warehouse probe and include the Character ID and Name lines when you report it.")
         end
     end)
 end
@@ -540,7 +494,7 @@ end
 function Scan:Instant(id)
     local i = self.instant[id]
     if i then return i end
-    local get = (C_Item and C_Item.GetItemInfoInstant) or rawget(_G, "GetItemInfoInstant")   -- RETEST
+    local get = C_Item and C_Item.GetItemInfoInstant                              -- RETEST
     local _, itemType, itemSubType, equipLoc, icon, classID, subclassID = ns.SafeCall(get, id)
     i = { typeName = Text(itemType), subName = Text(itemSubType), icon = Num(icon) or Text(icon),
           cls = Num(classID), sub = Num(subclassID) }
@@ -915,20 +869,28 @@ function Scan:OnSendMail(recipient)
     self.sending = { to = ns.Trim(recipient), items = items }
 end
 
--- One of your characters with that name in this region (names are unique
--- per region on Forever), on the same realm first
+-- The one character of yours with that name in your region and ruleset (mail
+-- doesn't cross them); a character whose ruleset the game hasn't reported
+-- yet counts if it's the only candidate. A name may not be unique, so if two
+-- match, nothing is added: the mailbox is saved anyway when that character
+-- opens it.
 function Scan:FindAlt(recipient)
     local me = self.me
     local name = ns.Trim(recipient:match("^(.-)%-.+$") or recipient)
     local lname = name:lower()
-    local fallback, fallbackKey
+    local exact, loose = {}, {}
     for key, c in pairs(WH.db.chars) do
         if c.region == me.region and (c.name == name or c.name:lower() == lname) then
-            if c.realmKey == me.realmKey then return c, key end
-            if not fallback then fallback, fallbackKey = c, key end
+            if c.ruleset == me.ruleset then
+                exact[#exact + 1] = key
+            elseif c.ruleset == "" or me.ruleset == "" then
+                loose[#loose + 1] = key
+            end
         end
     end
-    return fallback, fallbackKey
+    local key = (#exact == 1 and exact[1]) or (#exact == 0 and #loose == 1 and loose[1]) or nil
+    if key then return WH.db.chars[key], key end
+    return nil
 end
 
 function Scan:CommitSent()
@@ -952,30 +914,6 @@ end
 -- Guild bank
 -------------------------------------------------------------------------------
 local GB_SLOTS = MAX_GUILDBANK_SLOTS_PER_TAB or 98                         -- RETEST
-
--- A guild bank takes its region, ruleset and faction from your character
-function Scan:TouchGuild(g)
-    local me = self.me
-    g.area, g.faction = me.area, me.faction or g.faction
-    g.realm, g.realmKey = me.realm, me.realmKey
-    if me.ruleset ~= "" then g.ruleset = me.ruleset end
-end
-
-function Scan:GuildRecord(create)
-    local key, gname = self:CurrentGuildKey()
-    if not key then return nil end
-    local g = WH.db.guilds[key]
-    if not g and create then
-        g = { name = gname, region = self.me.region, tabs = {}, t = 0 }
-        WH.db.guilds[key] = g
-    end
-    if g then
-        Scan.RepairGuild(g, WH.db)
-        self:TouchGuild(g)
-        self.me.guild = key
-    end
-    return g, key
-end
 
 function Scan:ScanGuildMoney()
     local g = self.open.guild and self:GuildRecord(true)
@@ -1160,63 +1098,12 @@ end
 -------------------------------------------------------------------------------
 -- Settings changed by the player
 -------------------------------------------------------------------------------
-local RULE_WORDS = { normal = "normal", pve = "normal", pvp = "pvp", rp = "rp", roleplay = "rp",
-                     rppvp = "rppvp", ["rp-pvp"] = "rppvp", hardcore = "hardcore", hc = "hardcore" }
-
--- Sets the ruleset of every character (and guild bank) on a realm. A realm
--- known only as "?" (no name and no server number) can't be shared.
-function Scan:SetRealmRuleset(realmKey, ruleset)
-    local db = WH.db
-    local r = db.realms[realmKey]
-    if not r or r.unknown or r.detected or not (ruleset == "" or ns.RULESETS[ruleset]) then return end
-    r.ruleset, r.guessed = ruleset, false
-    for _, c in pairs(db.chars) do
-        if c.realmKey == realmKey and not c.rulesetDetected then c.ruleset, c.rulesetGuessed = ruleset, false end
-    end
-    for _, g in pairs(db.guilds) do
-        if g.realmKey == realmKey then g.ruleset = ruleset end
-    end
-    self:Changed()
-end
-
-function Scan:SetCharRuleset(key, ruleset)
-    local db = WH.db
-    local c = db.chars[key]
-    if not c or c.rulesetDetected or not (ruleset == "" or ns.RULESETS[ruleset]) then return end
-    local r = db.realms[c.realmKey]
-    if r and not r.unknown and not r.detected then
-        self:SetRealmRuleset(c.realmKey, ruleset)
-        return
-    end
-    c.ruleset, c.rulesetGuessed = ruleset, false
-    local g = c.guild and db.guilds[c.guild]
-    if g then g.ruleset = ruleset end
-    self:Changed()
-end
-
--- Same region and ruleset as the character you're playing (on Forever that's
--- the same realm); the same realm key when either ruleset isn't set
+-- Same region and ruleset as the character you're playing (Forever has no
+-- realms: a region and a ruleset make one world)
 function Scan:SameWorld(rec)
     local me = self.me
-    if not me or rec.region ~= me.region then return false end
-    if me.ruleset ~= "" and (rec.ruleset or "") ~= "" then return rec.ruleset == me.ruleset end
-    return rec.realmKey == me.realmKey
-end
-
-function Scan:SetMyRuleset(word)
-    local me = self.me
-    if not me then ns.Print("this character isn't identified yet.") return end
-    if me.rulesetDetected then
-        ns.Print(("the game says %s is on %s, so Warehouse uses that."):format(me.name, ns.RulesetLabel(me)))
-        return
-    end
-    local rs = RULE_WORDS[(word or ""):lower()]
-    if not rs then
-        ns.Print(("%s's ruleset is %s. Use /warehouse ruleset normal, pvp, rp, rppvp or hardcore."):format(me.name, ns.RulesetLabel(me)))
-        return
-    end
-    self:SetCharRuleset(self.meKey, rs)
-    ns.Print(("%s is now marked %s (%s)."):format(me.name, ns.RULESETS[rs].label, ns.RULE_GROUPS[ns.RULESETS[rs].group]))
+    if not me then return false end
+    return rec.region == me.region and (rec.ruleset or "") == (me.ruleset or "")
 end
 
 function Scan:ForgetChar(key)
@@ -1237,6 +1124,12 @@ function Scan:ForgetGuild(key)
     local g = WH.db.guilds[key]
     if not g then return false end
     WH.db.guilds[key] = nil
+    local s = WH.db.settings
+    s.guildOff[key] = nil
+    local prefix = ns.GuildTabKey(key, "")
+    for k in pairs(s.tabOff) do
+        if k:sub(1, #prefix) == prefix then s.tabOff[k] = nil end
+    end
     self:Changed()
     ns.Print(("forgot the guild bank of <%s>."):format(g.name))
     return true
@@ -1255,10 +1148,6 @@ function Scan:SortedChars()
         return a.c.name < b.c.name
     end)
     return list
-end
-
-function Scan:RealmOf(rec)
-    return rec.realmKey and WH.db.realms[rec.realmKey] or nil
 end
 
 function Scan:PrintCharacters()

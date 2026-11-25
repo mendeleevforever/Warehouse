@@ -19,35 +19,12 @@ local W, H = UI.W, UI.H
 -- Characters tab
 -------------------------------------------------------------------------------
 local CH_LEFT_R, CH_RIGHT_X = 520, 548
-local CHAR_ROW_H, REALM_ROW_H, GUILD_ROW_H = 36, 22, 34
+local CHAR_ROW_H, GUILD_ROW_H = 36, 34
 
--- long: say where the ruleset came from
-local function RulesetText(rec, long)
-    local rs = ns.RULESETS[rec.ruleset or ""]
-    if not rs then return "|cffff6040ruleset not set|r" end
-    if rec.rulesetGuessed then return rs.label .. " (from the realm name)" end
-    if long then
-        if rec.rulesetDetected then return rs.label .. " (from the game)" end
-        return rs.label .. " (set by you, or by a character on the same server)"
-    end
-    return rs.label
-end
-
--- A ruleset the game reported can't be changed by hand
-local function ReadOnlyRuleset(items, rs)
-    items[#items + 1] = { label = ("%s, read from the game"):format(ns.RULESETS[rs] and ns.RULESETS[rs].label or "?"), muted = true }
-    return items
-end
-
--- Ruleset radio items; set(ruleset) applies the choice
-local function RulesetChoices(items, current, set)
-    for _, k in ipairs(ns.RULESET_ORDER) do
-        local rs = ns.RULESETS[k]
-        items[#items + 1] = { text = ("%s  %s(%s)|r"):format(rs.label, GREY, ns.RULE_GROUPS[rs.group]), checked = current == k,
-            onClick = function() set(k) end }
-    end
-    items[#items + 1] = { text = "Not set", checked = (current or "") == "", onClick = function() set("") end }
-    return items
+-- The ruleset as the game reported it (red until it has)
+local function RulesetText(rec)
+    if not ns.RULESETS[rec.ruleset or ""] then return "|cffff6040" .. ns.RulesetLabel(rec) .. "|r" end
+    return ns.RulesetLabel(rec)
 end
 
 function WH:CharMenuItems(key)
@@ -57,41 +34,13 @@ function WH:CharMenuItems(key)
         { label = c.name },
         { text = "Show only their items", onClick = function() WH:PickOwner(key) end },
         { separator = true },
-        { label = "Ruleset" },
     }
-    if c.rulesetDetected then
-        ReadOnlyRuleset(items, c.ruleset)
-    else
-        RulesetChoices(items, c.ruleset, function(rs) Scan:SetCharRuleset(key, rs) end)
-    end
-    items[#items + 1] = { separator = true }
     if key == Scan.meKey then
         items[#items + 1] = { label = "You're playing this character", muted = true }
     else
         items[#items + 1] = { text = "Forget " .. c.name .. "...", onClick = function() WH:ConfirmForgetChar(key) end }
     end
     return items
-end
-
--- A realm's display name: its name when the client gave one, else its server number
-local function RealmLabel(r)
-    if r.name and r.name ~= "" then return r.name end
-    if r.server then return "Server " .. r.server end
-    return "Unknown realm"
-end
-
-function WH:RulesetMenuItems(realmKey)
-    local r = self.db.realms[realmKey]
-    if not r then return {} end
-    if r.detected then return ReadOnlyRuleset({ { label = RealmLabel(r) } }, r.ruleset) end
-    return RulesetChoices({ { label = RealmLabel(r) } }, r.ruleset, function(rs) Scan:SetRealmRuleset(realmKey, rs) end)
-end
-
-function WH:CharRulesetItems(key)
-    local c = self.db.chars[key]
-    if not c then return {} end
-    if c.rulesetDetected then return ReadOnlyRuleset({ { label = c.name } }, c.ruleset) end
-    return RulesetChoices({ { label = c.name } }, c.ruleset, function(rs) Scan:SetCharRuleset(key, rs) end)
 end
 
 local function RefreshAfterMenu()
@@ -109,9 +58,7 @@ function WH:CharHover(row, key, c)
     local mu = C.muted
     GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
     GameTooltip:AddLine(ns.OwnerLabel("char", c), 1, 1, 1)
-    local realmName = ns.RealmName(c)
-    GameTooltip:AddLine(("%s%s  •  %s"):format(realmName and (realmName .. "  •  ") or "", RulesetText(c, true),
-        ns.AREAS[c.area]), mu[1], mu[2], mu[3], true)
+    GameTooltip:AddLine(("%s  •  %s  •  %s"):format(RulesetText(c), ns.AREAS[c.area], c.faction or "?"), mu[1], mu[2], mu[3], true)
     GameTooltip:AddLine(" ")
     local function Line(label, value) GameTooltip:AddDoubleLine(label, value, mu[1], mu[2], mu[3], 1, 1, 1) end
     Line(LocLine(c.bags, "Bags", "not saved yet"))
@@ -131,7 +78,7 @@ function WH:CharHover(row, key, c)
     if g then Line("Guild", ns.OwnerLabel("guild", g)) end
     Line("Gold", ns.Coins(c.money))
     GameTooltip:AddLine(" ")
-    GameTooltip:AddLine("Click to show only their items. Right-click for ruleset and forget.", mu[1], mu[2], mu[3], true)
+    GameTooltip:AddLine("Click to show only their items. Right-click to forget them.", mu[1], mu[2], mu[3], true)
     GameTooltip:Show()
 end
 
@@ -152,7 +99,7 @@ function WH:CreateCharsView(f)
 
     ---------------------------------------------------------------- Characters
     UI.AddSection(cv, "Characters", -46, 20, LEFT_RULE)
-    local hint = AddLabel(cv, "Click a character to show only what they hold. Right-click to set their ruleset (if the game couldn't) or forget them.", nil, C.muted)
+    local hint = AddLabel(cv, "Click a character to show only what they hold. Right-click to forget them. Region, ruleset and faction are read from the game at each login.", nil, C.muted)
     hint:SetPoint("TOPLEFT", 22, -68)
     hint:SetWidth(LW)
     local cw = CH_LEFT_R - 24 - 22
@@ -210,61 +157,27 @@ function WH:CreateCharsView(f)
         row.name:SetText(ns.OwnerLabel("char", c) .. (c.level and (GREY .. "  level " .. c.level .. "|r") or ""))
         row.gold:SetText(ns.Coins(c.money))
         local faction = c.faction and (c.faction == "Horde" and "|cffff5a5aHorde|r" or (c.faction == "Alliance" and "|cff5a9cffAlliance|r" or c.faction)) or "?"
-        local realmName = ns.RealmName(c)
-        row.info:SetText(("%s%s  •  %s  •  %s"):format(realmName and (realmName .. "  •  ") or "", RulesetText(c),
-            ns.AREAS[c.area], faction))
+        row.info:SetText(("%s  •  %s  •  %s"):format(RulesetText(c), ns.AREAS[c.area], faction))
         row.seen:SetText(it.key == Scan.meKey and "playing now" or ("seen " .. ns.Ago(c.lastSeen)))
     end)
     cv.charEmpty = AddLabel(child, "", "GameFontNormalSmall", C.muted)
     cv.charEmpty:SetPoint("TOPLEFT", 6, -6)
     cv.charEmpty:SetWidth(cw - 20)
 
-    ---------------------------------------------------------------- Realms
-    UI.AddSection(cv, "Realms", -46, CH_RIGHT_X, -20)
-    local rhint = AddLabel(cv, "Rulesets are read from the game at each login. Set one here only if the game couldn't say.", nil, C.muted)
-    rhint:SetPoint("TOPLEFT", CH_RIGHT_X + 2, -68)
-    rhint:SetWidth(RW)
     local rw = RW - 24
-    local rscroll, rchild = UI.MakeScroll("WarehouseRealmScroll", cv, rw)
-    rscroll:SetPoint("TOPLEFT", CH_RIGHT_X, -86)
-    rscroll:SetPoint("BOTTOMRIGHT", cv, "TOPRIGHT", -44, -86 - 5 * REALM_ROW_H)
-    cv.realmList = UI.AttachVirtualList(rscroll, rchild, REALM_ROW_H, function()
-        local row = CreateFrame("Frame", nil, rchild)
-        row:SetSize(rw, REALM_ROW_H)
-        row.name = NoWrap(AddLabel(row, "", "GameFontHighlightSmall", C.text))
-        row.name:SetPoint("LEFT", 6, 0)
-        row.name:SetWidth(rw - 110 - 70)
-        row.info = NoWrap(AddLabel(row, "", "GameFontNormalSmall", C.muted))
-        row.info:SetPoint("RIGHT", -100, 0)
-        row.info:SetJustifyH("RIGHT")
-        row.info:SetWidth(70)
-        row.btn = FlatButton(row, "", 92, 18)
-        row.btn:SetPoint("RIGHT", -2, 0)
-        row.btn:SetScript("OnClick", function(self)
-            local it = self:GetParent().item
-            if it then UI.ShowMenu(self, function() return WH:RulesetMenuItems(it.key) end, 190, RefreshAfterMenu) end
-        end)
-        AddHoverTip(row.btn, "Ruleset", "Read from the game when one of your characters on this server logs in. If the game couldn't say, choose it here: every character on the server gets the same one. The Ruleset filter groups them into PvE and PvP.")
-        return row
-    end, function(row, it, idx)
-        UI.StripeRow(row, idx)
-        row.item = it
-        row.name:SetText(RealmLabel(it.r))
-        row.info:SetText(("%s  •  %d"):format(it.r.region, it.n))
-        local rs = ns.RULESETS[it.r.ruleset]
-        row.btn.label:SetText((rs and rs.label or "|cffff6040Set ruleset|r") .. (it.r.detected and "" or "  |cffffd100v|r"))
-        SetFlatSelected(row.btn, rs == nil)
-    end)
 
     ---------------------------------------------------------------- Guild banks
-    UI.AddSection(cv, "Guild Banks", -212, CH_RIGHT_X, -20)
+    UI.AddSection(cv, "Guild Banks", -46, CH_RIGHT_X, -20)
+    local ghint = AddLabel(cv, "Click a guild bank to show only what it holds. Right-click to forget it.", nil, C.muted)
+    ghint:SetPoint("TOPLEFT", CH_RIGHT_X + 2, -68)
+    ghint:SetWidth(RW)
     local gscroll, gchild = UI.MakeScroll("WarehouseGuildScroll", cv, rw)
-    gscroll:SetPoint("TOPLEFT", CH_RIGHT_X, -236)
-    gscroll:SetPoint("BOTTOMRIGHT", cv, "TOPRIGHT", -44, -236 - 5 * GUILD_ROW_H)
+    gscroll:SetPoint("TOPLEFT", CH_RIGHT_X, -92)
+    gscroll:SetPoint("BOTTOMRIGHT", cv, "TOPRIGHT", -44, -92 - 9 * GUILD_ROW_H)
     cv.guildList = UI.AttachVirtualList(gscroll, gchild, GUILD_ROW_H, function()
         local row = CreateFrame("Button", nil, gchild)
         row:SetSize(rw, GUILD_ROW_H)
-        row:RegisterForClicks("RightButtonUp")
+        row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
         row.name = NoWrap(AddLabel(row, "", "GameFontNormal", C.text))
         row.name:SetPoint("TOPLEFT", 6, -3)
         row.name:SetWidth(rw - 110)
@@ -278,11 +191,16 @@ function WH:CreateCharsView(f)
         local hl = row:CreateTexture(nil, "HIGHLIGHT")
         hl:SetAllPoints()
         hl:SetColorTexture(C.goldLight[1], C.goldLight[2], C.goldLight[3], 0.14)
-        row:SetScript("OnClick", function(self)
+        row:SetScript("OnClick", function(self, button)
             local it = self.item
             if not it then return end
+            if button ~= "RightButton" then
+                WH:PickGuild(it.key)
+                return
+            end
             UI.ShowMenu(self, function()
                 return { { label = "<" .. it.g.name .. ">" },
+                         { text = "Show only its items", onClick = function() WH:PickGuild(it.key) end },
                          { text = "Forget this guild bank...", onClick = function() WH:ConfirmForgetGuild(it.key) end } }
             end, 200, RefreshAfterMenu)
         end)
@@ -304,7 +222,7 @@ function WH:CreateCharsView(f)
             end
             if #tabs == 0 then GameTooltip:AddLine("No tab saved yet. Open the guild bank to save it.", mu[1], mu[2], mu[3], true) end
             GameTooltip:AddLine(" ")
-            GameTooltip:AddLine("Tabs you can't view aren't saved. Right-click to forget this guild bank.", mu[1], mu[2], mu[3], true)
+            GameTooltip:AddLine("Tabs you can't view aren't saved. Click to show only this guild bank's items; right-click to forget it.", mu[1], mu[2], mu[3], true)
             GameTooltip:Show()
         end)
         row:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -346,21 +264,6 @@ function WH:RefreshChars()
     local list = Scan:SortedChars()
     cv.charList:SetData(list)
     cv.charEmpty:SetText(#list == 0 and "No characters saved yet." or "")
-
-    local counts = {}
-    for _, it in ipairs(list) do
-        local rk = it.c.realmKey
-        counts[rk] = (counts[rk] or 0) + 1
-    end
-    local realms = {}
-    for key, r in pairs(self.db.realms) do
-        if counts[key] and not r.unknown then realms[#realms + 1] = { key = key, r = r, n = counts[key] } end
-    end
-    table.sort(realms, function(a, b)
-        if a.r.region ~= b.r.region then return a.r.region < b.r.region end
-        return RealmLabel(a.r) < RealmLabel(b.r)
-    end)
-    cv.realmList:SetData(realms)
 
     local guilds = {}
     for key, g in pairs(self.db.guilds) do guilds[#guilds + 1] = { key = key, g = g } end
@@ -423,7 +326,7 @@ end
 -------------------------------------------------------------------------------
 local OPT_LEFT_R, OPT_RIGHT_X = 430, 450
 local STORAGE = { "Characters", "Guild banks", "Item stacks", "Mail attachments", "Item names known", "Saved data" }
-local SCOPES = { { "realm", "This ruleset" }, { "region", "This region" }, { "all", "Everywhere" } }
+local SCOPES = { { "ruleset", "This ruleset" }, { "region", "This region" }, { "all", "Everywhere" } }
 local EXPIRE = { 1, 3, 7 }
 
 local function EstimateStorage(db)
@@ -555,14 +458,6 @@ function WH:CreateOptionsView(f)
     ov.me2 = NoWrap(AddLabel(ov, "", "GameFontNormalSmall", C.text))
     ov.me2:SetPoint("TOPLEFT", OPT_RIGHT_X + 2, -209)
     ov.me2:SetWidth(RW - 4)
-    local rsBtn = FlatButton(ov, "Ruleset  |cffffd100v|r", 110, 18)
-    rsBtn:SetPoint("TOPLEFT", OPT_RIGHT_X + 2, -228)
-    rsBtn:SetScript("OnClick", function(self)
-        if Scan.meKey then
-            UI.ShowMenu(self, function() return WH:CharRulesetItems(Scan.meKey) end, 190, function() WH:RefreshOptions() end)
-        end
-    end)
-    AddHoverTip(rsBtn, "This character's ruleset", "Read from the game at each login (Normal, PvP, Roleplay, Roleplay PvP or Hardcore). Choose it here only if the game couldn't say. The Ruleset filter uses it.")
 
     ---------------------------------------------------------------- Client
     UI.AddSection(ov, "Client", -262, OPT_RIGHT_X, -20)
@@ -613,10 +508,8 @@ function WH:RefreshOptions()
 
     if me then
         ov.me1:SetText(("%s  %s— %s, %s|r"):format(ns.OwnerLabel("char", me), GREY, ns.AREAS[me.area], me.faction or "faction unknown"))
-        local rs = ns.RULESETS[me.ruleset]
-        local realm = Scan:RealmOf(me)
-        ov.me2:SetText(("Ruleset %s%s  %s— %s|r"):format(rs and (rs.label .. " (" .. ns.RULE_GROUPS[rs.group] .. ")") or "|cffff6040not set|r",
-            me.rulesetDetected and (GREY .. ", from the game|r") or "", GREY, realm and RealmLabel(realm) or "realm unknown"))
+        local _, regionFrom = ns.GetRegion()
+        ov.me2:SetText(("Ruleset %s  %s— region from %s|r"):format(RulesetText(me), GREY, regionFrom or "?"))
     else
         ov.me1:SetText(GREY .. "This character isn't identified yet.|r")
         ov.me2:SetText("")

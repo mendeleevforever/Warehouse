@@ -23,7 +23,7 @@ local CONTENT_BOT   = 52
 local LEFT_X, LEFT_R = 16, 332            -- item list panel
 local RIGHT_X       = 344                 -- detail panel (to W - 16)
 local LIST_X        = LEFT_X + 4
-local LIST_TOP      = CONTENT_TOP - 56
+local LIST_TOP      = CONTENT_TOP - 80     -- under the search row and two rows of filter selectors
 local LIST_W        = LEFT_R - 24 - LIST_X
 local ROW_H         = 22
 local DW            = W - 16 - RIGHT_X    -- detail panel width
@@ -35,7 +35,7 @@ local COUNT_W       = 64
 local WHERE_ROW_H   = 20
 local LOC_BTN_W     = 44
 local LOC_W         = 6 * LOC_BTN_W + 5 * 3
-local SEL_W, SEL_GAP = 74, 4
+local SEL_GAP       = 5
 local ICON          = 413587
 local CHARS_ICON    = "Interface\\Icons\\INV_Misc_Head_Human_01"
 local OPTIONS_ICON  = "Interface\\Icons\\INV_Misc_Gear_01"
@@ -165,6 +165,28 @@ function WH:PickOwner(key)
     self:RefreshItems(true)
 end
 
+-- Show only one guild bank's items: its location alone, the other guild
+-- banks left out, and whatever else was hiding it cleared
+function WH:PickGuild(key)
+    local g = self.db.guilds[key]
+    if not g then return end
+    local s = self.db.settings
+    for _, loc in ipairs(ns.LOCATIONS) do s.locations[loc] = (loc == "guild") end
+    wipe(s.guildOff)
+    wipe(s.tabOff)
+    for gk in pairs(self.db.guilds) do
+        if gk ~= key then s.guildOff[gk] = true end
+    end
+    if not Index:OwnerPasses("guild", key, g) then
+        s.who = "all"
+        s.regions[ns.AreaGroup(g.area)] = true
+        s.rulesets[ns.RuleKey(g.ruleset)] = true
+        if g.faction then s.factions[g.faction] = true end
+    end
+    self:Open("items")
+    self:RefreshItems(true)
+end
+
 local refreshTimer
 function WH:RequestUIRefresh(delay)
     local f = self.frame
@@ -227,7 +249,7 @@ end
 local TAB_INFO = {
     options = { title = "Options", body = "What's saved, item tooltips, mail warnings, the minimap button and a client check" },
     items   = { title = "Items", body = "Search everything your characters hold, and see where each stack is" },
-    chars   = { title = "Characters", body = "Your characters and guild banks: region, realm ruleset, faction, gold and when each was saved" },
+    chars   = { title = "Characters", body = "Your characters and guild banks: region, ruleset, faction, gold and when each was saved" },
 }
 
 local function CreateTab(f, key, icon, y)
@@ -292,7 +314,7 @@ end
 
 local LEGENDS = {
     items   = function() return "Click an item to see where it is (again for the overview)" .. DOT .. "Shift-click to link it" .. DOT .. "Hover a bar for each location" end,
-    chars   = function() return "Click a character to show only their items" .. DOT .. "Right-click for ruleset and forget" .. DOT .. "Gold is saved as it changes" end,
+    chars   = function() return "Click a character to show only their items" .. DOT .. "Right-click to forget" .. DOT .. "Region, ruleset and faction come from the game" end,
     options = function() return ("Warehouse %s"):format(WH.VERSION) .. DOT .. "Saved for every character on this account" .. DOT .. "/warehouse help" end,
 }
 
@@ -327,7 +349,7 @@ function WH:OwnerCounts()
     for _, c in pairs(self.db.chars) do
         local a = ns.AreaGroup(c.area)
         out.area[a] = (out.area[a] or 0) + 1
-        local r = ns.RuleGroup(c.ruleset)
+        local r = ns.RuleKey(c.ruleset)
         out.rule[r] = (out.rule[r] or 0) + 1
         if c.faction then out.faction[c.faction] = (out.faction[c.faction] or 0) + 1 end
     end
@@ -348,10 +370,11 @@ local SELECTORS = {
         note = "US includes Oceanic: one world, one auction house.",
     },
     ruleset = {
-        title = "Ruleset", setting = "rulesets", order = { "PVE", "PVP", "UNSET" }, labels = ns.RULE_GROUPS, countKey = "rule",
-        optional = { UNSET = true }, short = { PVE = "PvE", PVP = "PvP", UNSET = "Unset" },
+        title = "Ruleset", setting = "rulesets", order = ns.RULE_FILTER, labels = ns.RULE_LABELS, countKey = "rule",
+        optional = { RP = true, Hardcore = true, UNSET = true },
+        short = { PvE = "PvE", PvP = "PvP", RP = "RP", Hardcore = "Hardcore", UNSET = "Not read" },
         all = "Show all rulesets",
-        note = "PvE: Normal, Roleplay, Hardcore.  PvP: PvP, Roleplay PvP.",
+        note = "Read from the game when each character logs in.",
     },
     faction = {
         title = "Faction", setting = "factions", order = ns.FACTION_ORDER, labels = ns.FACTIONS, countKey = "faction",
@@ -368,11 +391,51 @@ local function VisibleChoices(def, counts)
     return out
 end
 
+-- Saved guild banks, sorted by name, each with its tab numbers in order
+function WH:SortedGuilds()
+    local list = {}
+    for key, g in pairs(self.db.guilds) do
+        local tabs = {}
+        for tab in pairs(g.tabs) do tabs[#tabs + 1] = tab end
+        table.sort(tabs)
+        list[#list + 1] = { key = key, g = g, tabs = tabs }
+    end
+    table.sort(list, function(a, b)
+        if a.g.name ~= b.g.name then return a.g.name < b.g.name end
+        return a.key < b.key
+    end)
+    return list
+end
+
+local function GuildState(self)
+    local s = self.db.settings
+    if not s.locations.guild then return "No guild banks", true end
+    local banks, shownBanks, tabs, shownTabs = 0, 0, 0, 0
+    local lastBank, lastTab
+    for _, it in ipairs(self:SortedGuilds()) do
+        banks = banks + 1
+        if Index:GuildShown(it.key) then
+            shownBanks, lastBank = shownBanks + 1, it.g
+            for _, tab in ipairs(it.tabs) do
+                tabs = tabs + 1
+                if Index:TabShown(it.key, tab) then shownTabs, lastTab = shownTabs + 1, it.g.tabs[tab] end
+            end
+        end
+    end
+    if shownBanks == banks and shownTabs == tabs then return "Guild banks", false end
+    if shownBanks == 0 or (tabs > 0 and shownTabs == 0) then return "No guild banks", true end
+    if shownBanks == 1 and shownTabs == 1 and lastTab then return lastTab.name, true end
+    if shownBanks == 1 and shownTabs == tabs then return "<" .. lastBank.name .. ">", true end
+    if shownTabs < tabs then return ("%d of %d tabs"):format(shownTabs, tabs), true end
+    return ("%d of %d guild banks"):format(shownBanks, banks), true
+end
+
 function WH:SelectorState(kind)
     local s = self.db.settings
+    if kind == "guild" then return GuildState(self) end
     if kind == "who" then
         if s.who == "me" then return "Only me", true end
-        if s.who == "realm" then return "This ruleset", true end
+        if s.who == "ruleset" then return "This ruleset", true end
         if s.who == "pick" then
             local c = self.db.chars[s.pick]
             return c and c.name or "Characters", c ~= nil
@@ -390,7 +453,7 @@ function WH:SelectorState(kind)
 end
 
 function WH:AnyFilterActive()
-    for _, kind in ipairs({ "region", "ruleset", "faction" }) do
+    for _, kind in ipairs({ "region", "ruleset", "faction", "guild" }) do
         local _, active = self:SelectorState(kind)
         if active then return true end
     end
@@ -426,8 +489,8 @@ function WH:WhoItems()
         { text = "All characters", checked = s.who == "all", onClick = function() s.who = "all" end },
         { text = "Only the character you're playing", checked = s.who == "me", onClick = function() s.who = "me" end,
           tip = "Their own bags, bank, mail and gear, plus their guild's bank." },
-        { text = "Only this ruleset", checked = s.who == "realm", onClick = function() s.who = "realm" end,
-          tip = "Every character in your region on the same ruleset as the one you're playing (on Forever that's the same realm), and their guild banks." },
+        { text = "Only this ruleset", checked = s.who == "ruleset", onClick = function() s.who = "ruleset" end,
+          tip = "Every character in your region on the same ruleset as the one you're playing, and their guild banks." },
         { separator = true },
         { label = "Show one character" },
     }
@@ -441,6 +504,41 @@ function WH:WhoItems()
         items[#items + 1] = { text = ns.OwnerLabel("char", it.c) .. GREY .. "  " .. ns.AREAS[it.c.area] .. "|r",
             checked = s.who == "pick" and s.pick == key, onClick = function() s.who, s.pick = "pick", key end }
     end
+    return items
+end
+
+-- Guild banks and their tabs, each one a checkbox
+function WH:GuildItems()
+    local s = self.db.settings
+    local items = { { label = "Guild banks" } }
+    local list = self:SortedGuilds()
+    if #list == 0 then
+        items[#items + 1] = { label = "None saved yet: open a guild bank to save it.", muted = true }
+        return items
+    end
+    for _, it in ipairs(list) do
+        local key, g = it.key, it.g
+        items[#items + 1] = { text = ns.OwnerLabel("guild", g) .. CountSuffix(#it.tabs), checked = not s.guildOff[key],
+            onClick = function() s.guildOff[key] = not s.guildOff[key] or nil end,
+            tip = "Show this guild bank's items. Untick tabs below to leave just those out." }
+        if not s.guildOff[key] then
+            for _, tab in ipairs(it.tabs) do
+                local tkey = ns.GuildTabKey(key, tab)
+                local t = g.tabs[tab]
+                local n = Scan.CountItems(t.items)
+                items[#items + 1] = { text = ("      %s  %s(%s)|r"):format(t.name, GREY, ns.Commas(n)), checked = not s.tabOff[tkey],
+                    onClick = function() s.tabOff[tkey] = not s.tabOff[tkey] or nil end }
+            end
+        end
+    end
+    items[#items + 1] = { separator = true }
+    items[#items + 1] = { text = "Show all guild banks and tabs", onClick = function()
+        wipe(s.guildOff); wipe(s.tabOff); s.locations.guild = true
+    end }
+    items[#items + 1] = { text = "Only guild bank items", onClick = function()
+        for _, loc in ipairs(ns.LOCATIONS) do s.locations[loc] = (loc == "guild") end
+    end, tip = "Hide bags, banks, mail and equipped gear (the location buttons above do the same)." }
+    items[#items + 1] = { text = "Hide guild banks", onClick = function() s.locations.guild = false end }
     return items
 end
 
@@ -599,17 +697,24 @@ function WH:CreateItemsView(f)
     iv.filter = filter
 
     iv.selectors = {}
+    -- row one: Region, Ruleset, Faction; row two: Characters, Guild banks
+    local rowW = LEFT_R - LEFT_X - 12
     local defs = {
         { "region",  function() return WH:SelectorItems("region") end, "Region", "US or EU characters (and their guild banks), as the game reports them. US includes Oceanic." },
         { "ruleset", function() return WH:SelectorItems("ruleset") end, "Ruleset", "Characters on PvE or PvP rulesets, as the game reports them when each character logs in." },
         { "faction", function() return WH:SelectorItems("faction") end, "Faction", "Horde or Alliance characters and guild banks." },
         { "who",     function() return WH:WhoItems() end, "Characters", "Everyone, the character you're playing, this ruleset, or one character." },
+        { "guild",   function() return WH:GuildItems() end, "Guild banks", "Which guild banks, and which of their tabs, to include. The Guild button above shows or hides every guild bank." },
     }
+    local w3 = math.floor((rowW - 2 * SEL_GAP) / 3)
+    local w2 = math.floor((rowW - SEL_GAP) / 2)
     for i, d in ipairs(defs) do
-        local b = FlatButton(iv, d[3], SEL_W, 20)
-        b:SetPoint("TOPLEFT", LEFT_X + 6 + (i - 1) * (SEL_W + SEL_GAP), CONTENT_TOP - 31)
+        local row, col, w = 1, i - 1, w3
+        if i > 3 then row, col, w = 2, i - 4, w2 end
+        local b = FlatButton(iv, d[3], w, 20)
+        b:SetPoint("TOPLEFT", LEFT_X + 6 + col * (w + SEL_GAP), CONTENT_TOP - 31 - (row - 1) * 24)
         local build = d[2]
-        b:SetScript("OnClick", function(self) UI.ShowMenu(self, build, d[1] == "who" and 250 or 220, AfterFilterChange) end)
+        b:SetScript("OnClick", function(self) UI.ShowMenu(self, build, (d[1] == "who" or d[1] == "guild") and 250 or 220, AfterFilterChange) end)
         AddHoverTip(b, d[3], d[4])
         iv.selectors[d[1]] = b
     end
@@ -1019,7 +1124,8 @@ function WH:CreateChart(d)
         r:SetScript("OnLeave", function() GameTooltip:Hide() end)
         r:SetScript("OnClick", function(self)
             local o = self.owner
-            if o and o.kind == "char" and o.key then WH:PickOwner(o.key) end
+            if not o or not o.key then return end
+            if o.kind == "char" then WH:PickOwner(o.key) elseif o.kind == "guild" then WH:PickGuild(o.key) end
         end)
         r:Hide()
         g.rows[i] = r
@@ -1071,6 +1177,8 @@ function WH:ChartHover(r)
     if o.kind == "char" then
         GameTooltip:AddLine(o.key == Scan.meKey and "Playing now" or ("Last seen " .. ns.Ago(o.rec.lastSeen)), mu[1], mu[2], mu[3])
         GameTooltip:AddLine("Click to show only this character's items", mu[1], mu[2], mu[3])
+    elseif o.kind == "guild" then
+        GameTooltip:AddLine("Click to show only this guild bank's items", mu[1], mu[2], mu[3])
     end
     GameTooltip:Show()
 end
@@ -1181,7 +1289,8 @@ function WH:CreateSummary(d)
         row:SetScript("OnLeave", function() GameTooltip:Hide() end)
         row:SetScript("OnClick", function(self)
             local r = self.item
-            if r and r.kind == "char" and r.owner then WH:PickOwner(r.owner) end
+            if not r or not r.owner then return end
+            if r.kind == "char" then WH:PickOwner(r.owner) elseif r.kind == "guild" then WH:PickGuild(r.owner) end
         end)
         return row
     end, function(row, r, idx)
@@ -1216,9 +1325,7 @@ function WH:WhereHover(row, r)
     local mu = C.muted
     GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
     GameTooltip:AddLine(ns.OwnerLabel(r.kind, r.rec), 1, 1, 1)
-    local rs = ns.RULESETS[r.rec.ruleset or ""]
-    GameTooltip:AddLine(("%s%s  •  %s"):format(ns.PlaceText(r.rec, true), rs and (" (" .. ns.RULE_GROUPS[rs.group] .. ")") or "",
-        r.rec.faction or "?"), mu[1], mu[2], mu[3], true)
+    GameTooltip:AddLine(("%s  •  %s"):format(ns.PlaceText(r.rec, true), r.rec.faction or "?"), mu[1], mu[2], mu[3], true)
     if r.overview then
         GameTooltip:AddLine(" ")
         for _, loc in ipairs(ns.LOCATIONS) do
@@ -1230,6 +1337,7 @@ function WH:WhereHover(row, r)
             GameTooltip:AddLine("Click to show only this character's items", mu[1], mu[2], mu[3])
         elseif r.rec.money then
             GameTooltip:AddDoubleLine("Gold", ns.Coins(r.rec.money), mu[1], mu[2], mu[3], 1, 1, 1)
+            GameTooltip:AddLine("Click to show only this guild bank's items", mu[1], mu[2], mu[3])
         end
         GameTooltip:Show()
         return
@@ -1250,7 +1358,11 @@ function WH:WhereHover(row, r)
     if r.kind == "char" and r.owner ~= Scan.meKey and r.loc == "bank" then
         GameTooltip:AddLine("The bank is saved each time this character opens it.", mu[1], mu[2], mu[3], true)
     end
-    if r.kind == "char" then GameTooltip:AddLine("Click to show only this character's items", mu[1], mu[2], mu[3]) end
+    if r.kind == "char" then
+        GameTooltip:AddLine("Click to show only this character's items", mu[1], mu[2], mu[3])
+    elseif r.kind == "guild" then
+        GameTooltip:AddLine("Click to show only this guild bank's items", mu[1], mu[2], mu[3])
+    end
     GameTooltip:Show()
 end
 

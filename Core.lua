@@ -9,12 +9,15 @@ local addonName, ns = ...
 -- out-of-combat queue, the background job runner, the capability probe and
 -- the /warehouse command.
 --
--- Unit data: Warehouse reads only the player's own name, class, level,
+-- Unit data: Warehouse reads only the player's own name, GUID, class, level,
 -- faction and guild name, plus links of equipped items. Every value goes
--- through ns.Text / ns.Num, which drop Midnight "secret" values before
--- anything compares, branches on, stores or prints them. Health and power are
--- never read, and nothing does arithmetic on a name. Warehouse never touches
--- the combat log and never compiles secure snippets.
+-- through ns.Text / ns.Num / ns.Bool, which drop Midnight "secret" values
+-- before anything compares, branches on, concatenates, stores or prints
+-- them. Health and power are never read, and nothing does arithmetic on a
+-- name. Warehouse never touches the combat log, never compiles secure
+-- snippets, never parses a GUID, and never keys anything by realm (Forever
+-- has no realms: only regions and rulesets). Region and ruleset are read
+-- only with ns.GetRegion and ns.GetRuleset below.
 --
 -- Lines marked RETEST depend on the client build; check them when the
 -- interface number moves off 16001.
@@ -23,7 +26,7 @@ local WH = {}
 ns.WH = WH
 if rawget(_G, "Warehouse") == nil then _G.Warehouse = WH end      -- for /dump Warehouse.db
 
-WH.VERSION          = "0.1.4"
+WH.VERSION          = "0.2.1"
 WH.TESTED_INTERFACE = 16001                                     -- RETEST: the build this was written against
 WH.PREFIX           = "|cffe6b422Warehouse:|r "
 
@@ -167,6 +170,11 @@ end
 -------------------------------------------------------------------------------
 -- Regions, rulesets, factions, locations: the vocabulary every file shares
 -------------------------------------------------------------------------------
+-- One guild bank tab, for the guild bank filter
+function ns.GuildTabKey(guildKey, tab)
+    return guildKey .. ":tab:" .. tostring(tab)
+end
+
 -- A character's region, as the client reports it (GetCurrentRegion). US
 -- covers the Americas and Oceania: Oceanic players share the US world and
 -- auction house, so they aren't told apart. KR, TW and CN are "Other".
@@ -183,21 +191,78 @@ function ns.AreaGroup(area)
     return "OTHER"
 end
 
--- Forever has one realm per ruleset per region, so a realm's ruleset is set
--- once for the realm. The filter groups rulesets into PvE and PvP.
+-- Rulesets: exactly what ns.GetRuleset can return. "" on a record means the
+-- game hasn't told Warehouse yet; the filter calls that "Not read yet".
 ns.RULESETS = {
-    normal   = { label = "Normal",       group = "PVE" },
-    pvp      = { label = "PvP",          group = "PVP" },
-    rp       = { label = "Roleplay",     group = "PVE" },
-    rppvp    = { label = "Roleplay PvP", group = "PVP" },
-    hardcore = { label = "Hardcore",     group = "PVE" },
+    PvE      = { label = "PvE" },
+    PvP      = { label = "PvP" },
+    RP       = { label = "RP" },
+    Hardcore = { label = "Hardcore" },
 }
-ns.RULESET_ORDER = { "normal", "pvp", "rp", "rppvp", "hardcore" }
-ns.RULE_GROUPS   = { PVE = "PvE", PVP = "PvP", UNSET = "Not set yet" }
+ns.RULESET_ORDER  = { "PvE", "PvP", "RP", "Hardcore" }
+ns.RULE_FILTER    = { "PvE", "PvP", "RP", "Hardcore", "UNSET" }
+ns.RULE_LABELS    = { PvE = "PvE", PvP = "PvP", RP = "RP", Hardcore = "Hardcore", UNSET = "Not read yet" }
 
-function ns.RuleGroup(ruleset)
-    local r = ns.RULESETS[ruleset or ""]
-    return r and r.group or "UNSET"
+-- The Ruleset filter's key for a record
+function ns.RuleKey(ruleset)
+    return ns.RULESETS[ruleset or ""] and ruleset or "UNSET"
+end
+
+-------------------------------------------------------------------------------
+-- Region and ruleset: read only these ways (the addon rules' GetRegion and
+-- GetRuleset), with every value that can be secret guarded first.
+-------------------------------------------------------------------------------
+local REGION_CODES = { [1] = "US", [2] = "KR", [3] = "EU", [4] = "TW", [5] = "CN" }
+
+-- The region code and where it came from. Prefers the regionID of the
+-- player's Battle.net game account, then the portal-based functions.
+-- KR and TW are one region group until a Taiwan player confirms the regionID
+-- reads TW, and the region is never used for anything that breaks if it's
+-- wrong: it's only shown and filtered on, never part of a saved key.
+function ns.GetRegion()
+    local guid = UnitGUID and ns.Text(UnitGUID("player"))
+    if guid and C_BattleNet and C_BattleNet.GetGameAccountInfoByGUID then           -- RETEST
+        local info = ns.SafeCall(C_BattleNet.GetGameAccountInfoByGUID, guid)
+        local id = type(info) == "table" and ns.Num(info.regionID) or nil
+        if id and REGION_CODES[id] then return REGION_CODES[id], "Battle.net game account" end
+    end
+    if GetCurrentRegionName then                                                       -- RETEST
+        local name = ns.Text((ns.SafeCall(GetCurrentRegionName)))
+        if name then return name:upper(), "GetCurrentRegionName" end
+    end
+    if GetCurrentRegion then                                                           -- RETEST
+        local id = ns.Num((ns.SafeCall(GetCurrentRegion)))
+        if id and REGION_CODES[id] then return REGION_CODES[id], "GetCurrentRegion" end
+        return nil, ("GetCurrentRegion gave an unknown ID (%s)"):format(tostring(id))
+    end
+    return nil, "no region function on this build"
+end
+
+-- The ruleset: Hardcore, RP, PvP, else PvE, checked in that order. nil when
+-- this build lacks the API or a rule's answer can't be read (secret or not a
+-- boolean). The second value describes each answer, for the probe.
+local RULE_CHECKS = { { "HardcoreRuleset", "Hardcore" }, { "RPRuleset", "RP" }, { "PvPRuleset", "PvP" } }
+
+function ns.GetRuleset()
+    if not (C_GameRules and C_GameRules.IsGameRuleActive and Enum and Enum.GameRule) then   -- RETEST
+        return nil, "C_GameRules.IsGameRuleActive is missing on this build"
+    end
+    local words = {}
+    for _, check in ipairs(RULE_CHECKS) do
+        local id = Enum.GameRule[check[1]]                                             -- RETEST: 10, 214, 213 on 71037
+        local on
+        if id == nil then
+            on = false                                    -- a rule this build doesn't have isn't active
+            words[#words + 1] = check[2] .. " missing"
+        else
+            local ok, v = pcall(C_GameRules.IsGameRuleActive, id)
+            if ok then on = ns.Bool(v) end
+            words[#words + 1] = check[2] .. " " .. (on == nil and "unreadable" or (on and "on" or "off"))
+        end
+        if on == nil then return nil, table.concat(words, ", ") end
+        if on then return check[2], table.concat(words, ", ") end
+    end
+    return "PvE", table.concat(words, ", ")
 end
 
 ns.FACTIONS      = { Horde = "Horde", Alliance = "Alliance", Neutral = "Neutral" }
@@ -211,7 +276,7 @@ ns.LOC_SHORT   = { bags = "Bags", bank = "Bank", guild = "Guild", mail = "Mail",
 -- SavedVariables: created in ADDON_LOADED (never at file scope), merged onto defaults
 -------------------------------------------------------------------------------
 ns.DEFAULTS = {
-    schema   = 2,
+    schema   = 3,
     settings = {
         sort           = "name",     -- name | total | owners | ilvl | quality | value | recent
         groupBy        = "type",     -- type | location | owner | quality | none
@@ -222,24 +287,25 @@ ns.DEFAULTS = {
         expireDays     = 3,
         warnExpiring   = true,       -- chat warning at login about mail that expires soon
         regions        = { US = true, EU = true, OTHER = true },
-        rulesets       = { PVE = true, PVP = true, UNSET = true },
+        rulesets       = { PvE = true, PvP = true, RP = true, Hardcore = true, UNSET = true },
         factions       = { Horde = true, Alliance = true, Neutral = true },
         locations      = { bags = true, bank = true, guild = true, mail = true, equipped = true },
-        who            = "all",      -- all | me | realm | pick
+        guildOff       = {},         -- [guild key] = true: guild banks left out (new ones are shown)
+        tabOff         = {},         -- [ns.GuildTabKey(guild key, tab)] = true: tabs left out
+        who            = "all",      -- all | me | ruleset | pick
         pick           = "",         -- character key when who == "pick"
         readGuildTabs  = true,       -- read every viewable guild bank tab, not only the ones you click
         trackSentMail  = true,       -- add mail sent to your alts to their mailbox
         tooltipCounts  = true,       -- add counts to item tooltips
-        tooltipScope   = "region",   -- realm | region | all
+        tooltipScope   = "region",   -- ruleset | region | all
         announce       = true,       -- one chat line after saving a bank, guild bank or mailbox
         lastTab        = "items",
     },
     collapsed   = {},                -- [group mode .. ":" .. group name] = true
     minimap     = { hide = false },
     positions   = {},
-    realms      = {},                -- [realm key] = { name, server, region, ruleset, guessed, unknown }
-    chars       = {},                -- [region/full name] = character record (Scan.lua)
-    guilds      = {},                -- [realm key/guild] = guild bank record (Scan.lua)
+    chars       = {},                -- [UnitGUID("player")] = character record (Scan.lua)
+    guilds      = {},                -- ["club:<id>" or "name:<faction>:<guild>"] = guild bank record (Scan.lua)
     names       = {},                -- [item key] = quality digit .. name
     links       = {},                -- [item key] = item string, for items with a suffix or bonus IDs
     namesLocale = "",
@@ -280,14 +346,7 @@ function WH:InitDB()
     if type(WarehouseDB) ~= "table" then WarehouseDB = {} end
     local db = MergeDefaults(WarehouseDB, ns.DEFAULTS)
 
-    for key, r in pairs(db.realms) do
-        if type(key) ~= "string" or type(r) ~= "table" or type(r.name) ~= "string" then
-            db.realms[key] = nil
-        else
-            if not ns.RULESETS[r.ruleset or ""] then r.ruleset = "" end
-            if type(r.region) ~= "string" then r.region = "??" end
-        end
-    end
+    db.realms = nil                                             -- 0.1.x kept realms; Forever has none
     for key, c in pairs(db.chars) do
         if type(key) ~= "string" or type(c) ~= "table" or type(c.name) ~= "string" then
             db.chars[key] = nil
@@ -315,10 +374,14 @@ function WH:InitDB()
         wipe(db.names)
         db.namesLocale = locale
     end
-    db.settings.regions.OCE = nil                               -- 0.1.0 to 0.1.3 had a separate Oceanic filter
-    if db.settings.who ~= "all" and db.settings.who ~= "me" and db.settings.who ~= "realm" and db.settings.who ~= "pick" then
-        db.settings.who = "all"
-    end
+    -- filter settings from 0.1.x
+    local s = db.settings
+    s.regions.OCE = nil
+    s.rulesets.PVE, s.rulesets.PVP = nil, nil
+    if s.who == "realm" then s.who = "ruleset" end
+    if s.tooltipScope == "realm" then s.tooltipScope = "ruleset" end
+    if s.who ~= "all" and s.who ~= "me" and s.who ~= "ruleset" and s.who ~= "pick" then s.who = "all" end
+    if s.tooltipScope ~= "ruleset" and s.tooltipScope ~= "region" and s.tooltipScope ~= "all" then s.tooltipScope = "region" end
     self.db = db
 
     -- per character: which record is this character's (see Scan:Identify)
@@ -478,21 +541,27 @@ function ns.Probe()
         return tostring(v)
     end
     local first, second = UnitName("player")
-    Add("Character", Scan.me ~= nil, Scan.me and ("%s (saved as %s)"):format(Scan.me.name, Scan.meKey)
+    Add("Character", Scan.me ~= nil, Scan.me and ("%s, saved under its UnitGUID"):format(Scan.me.name)
         or "not identified: nothing is saved this session")
+    local guid = UnitGUID and UnitGUID("player")
+    Add("Character ID", ns.Text(guid) ~= nil, (ns.Text(guid) and "UnitGUID is readable" or ("UnitGUID gives " .. Describe(guid)))
+        .. "; whether it stays the same between sessions on Forever isn't verified yet (Warehouse also remembers each character's key, and moves its record if the ID changes)")
     Add("Name", ns.Text(first) ~= nil, ("UnitName gives %s, %s"):format(Describe(first), Describe(second)))
-    local realmName, server = Scan.PlayerRealm()
     local faction = UnitFactionGroup("player")
     Add("Faction", ns.Text(faction) ~= nil, ("UnitFactionGroup gives %s"):format(Describe(faction)))
-    local ruleset, ruleDetail = Scan.DetectRuleset()
-    Add("Ruleset", ruleset ~= nil, ruleset and ("%s, from C_GameRules (%s)"):format(ns.RULESETS[ruleset].label, ruleDetail)
-        or ("not readable (%s): set per character"):format(ruleDetail))
-    Add("Realm", realmName ~= nil or server ~= nil, realmName and ("GetRealmName gives %s"):format(realmName)
-        or (server and ("GetRealmName is empty; server %s from the player GUID stands in"):format(server))
-        or "GetRealmName is empty and the player GUID is unreadable: rulesets are set per character")
-
-    local region = Scan:ClientRegion()
-    Add("Region", region ~= "??", ("client reports %s%s"):format(region, region == "US" and " (the Americas and Oceania: one world)" or ""))
+    local ruleset, ruleDetail = ns.GetRuleset()
+    Add("Ruleset", ruleset ~= nil, ruleset and ("%s (%s)"):format(ruleset, ruleDetail)
+        or ("not readable: %s"):format(ruleDetail))
+    local region, regionFrom = ns.GetRegion()
+    Add("Region", region ~= nil, region and ("%s, from %s%s"):format(region, regionFrom, region == "US" and " (the Americas and Oceania: one world)" or "")
+        or regionFrom)
+    -- C_Club.GetGuildClubId returned a number on the live client (November 24, 2026)
+    local clubFn = C_Club and C_Club.GetGuildClubId                                       -- RETEST
+    local clubID = clubFn and ns.SafeCall(clubFn)
+    clubID = ns.Num(clubID) or ns.Text(clubID)
+    Add("Guild ID", true, (clubID and ("C_Club.GetGuildClubId gives %s: your guild bank is saved under it"):format(tostring(clubID)))
+        or (clubFn and "C_Club.GetGuildClubId gives nothing right now (not in a guild, or not loaded yet): guild name and faction are used")
+        or "C_Club.GetGuildClubId missing: guild banks are keyed by guild name and faction")
     Add("Containers", C_Container and C_Container.GetContainerItemInfo,
         "C_Container.GetContainerNumSlots, C_Container.GetContainerItemInfo")   -- RETEST
     Add("Bag IDs", true, ListIDs(Scan:BagIDs()))
@@ -528,7 +597,6 @@ local HELP = {
     { "/warehouse <text>", "open the window and search (names, types, stats, effects or an item ID)" },
     { "/warehouse count <item>", "print who holds an item (name, item ID or shift-clicked link)" },
     { "/warehouse chars", "list your characters, their gold and when each was last seen" },
-    { "/warehouse ruleset <normal | pvp | rp | rppvp | hardcore>", "set this character's ruleset, if the game can't say" },
     { "/warehouse scan", "save your bags and gear now (and any open bank, guild bank or mailbox)" },
     { "/warehouse forget <character name>", "forget a character (asks first)" },
     { "/warehouse expiring", "list mail that expires soon on every character" },
@@ -560,7 +628,6 @@ commands.count = function(rest) ns.Index:PrintCount(rest) end
 commands.expiring = function() ns.Scan:WarnExpiring(true) end
 commands.scan = function() ns.Scan:ScanEverything(true) end
 commands.save = commands.scan
-commands.ruleset = function(rest) ns.Scan:SetMyRuleset(rest) end
 commands.forget = function(rest) WH:ConfirmForgetByName(rest) end
 commands.reset = function()
     WH.db.positions.main = nil
